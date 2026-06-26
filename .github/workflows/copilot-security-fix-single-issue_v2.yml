@@ -4,7 +4,7 @@
 # opens a single PR. No Copilot coding agent required.
 #
 # Called by consumer repos via:
-#   uses: rvinluan-aa/aa-ct-loyalty-reusable-workflows/.github/workflows/copilot-security-fix-single-issue_v2.yml@main
+#   uses: rvinluan-aa/aa-ct-loyalty-nexus-workflows/.github/workflows/copilot-security-fix-single-issue_v2.yml@main
 
 name: Nexus — AI-powered batch vulnerability fix (Reusable)
 
@@ -27,9 +27,9 @@ on:
         default: ''
         type: string
       use_security_pat:
-        description: 'Use SECURITY_PAT for AI calls instead of GITHUB_TOKEN. Both use GitHub Models (gpt-4.1). Enable if GITHUB_TOKEN lacks models: read or you want PAT-authenticated access.'
+        description: 'Use SECURITY_PAT for AI calls instead of GITHUB_TOKEN. Both use GitHub Models (gpt-4.1).'
         required: false
-        default: false
+        default: true
         type: boolean
     secrets:
       SECURITY_PAT:
@@ -37,7 +37,6 @@ on:
 
 permissions:
   contents: read
-  models: read   # allows GITHUB_TOKEN to call GitHub Models at no personal quota cost
 
 env:
   TARGET_REPO: ${{ inputs.target_repo || github.repository }}
