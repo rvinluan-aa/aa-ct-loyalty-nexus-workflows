@@ -50,6 +50,15 @@ jobs:
       - name: Checkout this repo (for nexus-fix.py)
         uses: actions/checkout@v4
 
+      - name: Normalize TARGET_REPO (strip full URL if pasted)
+        run: |
+          REPO="${TARGET_REPO}"
+          REPO="${REPO#https://github.com/}"
+          REPO="${REPO#http://github.com/}"
+          REPO="${REPO%/}"
+          echo "TARGET_REPO=${REPO}" >> "$GITHUB_ENV"
+          echo "Resolved target repo: ${REPO}"
+
       - name: Fetch open Dependabot alerts
         id: fetch_alerts
         env:
