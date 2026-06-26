@@ -47,8 +47,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: copilot
     steps:
-      - name: Checkout this repo (for nexus-fix.py)
+      - name: Checkout nexus-workflows (for nexus-fix.py)
         uses: actions/checkout@v4
+        with:
+          repository: rvinluan-aa/aa-ct-loyalty-nexus-workflows
+          path: .nexus-workflows
 
       - name: Normalize TARGET_REPO (strip full URL if pasted)
         run: |
@@ -124,7 +127,7 @@ jobs:
             PROVIDER="github-models"
           fi
           echo "AI provider: $PROVIDER"
-          python3 .github/scripts/nexus-fix.py \
+          python3 .nexus-workflows/.github/scripts/nexus-fix.py \
             --alerts /tmp/all_alerts.json \
             --repo-path /tmp/target-repo \
             --provider "$PROVIDER"
