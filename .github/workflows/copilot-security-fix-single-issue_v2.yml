@@ -1,0 +1,225 @@
+# Nexus Security Fix — Reusable Workflow
+# Fetches all open HIGH/CRITICAL Dependabot alerts, calls an AI model to
+# triage and apply all fixes in one pass (Spring Boot upgrade first), then
+# opens a single PR. No Copilot coding agent required.
+#
+# Called by consumer repos via:
+#   uses: rvinluan-aa/aa-ct-loyalty-reusable-workflows/.github/workflows/copilot-security-fix-single-issue_v2.yml@main
+
+name: Nexus — AI-powered batch vulnerability fix (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      severity_filter:
+        description: 'Severity filter (high, critical, or both)'
+        required: false
+        default: 'high,critical'
+        type: string
+      dry_run:
+        description: 'Dry run — fetch and triage alerts without opening a PR'
+        required: false
+        default: false
+        type: boolean
+      target_repo:
+        description: 'Repository to scan and fix (owner/repo). Defaults to the calling repository.'
+        required: false
+        default: ''
+        type: string
+      use_security_pat:
+        description: 'Use SECURITY_PAT for AI calls instead of GITHUB_TOKEN. Both use GitHub Models (gpt-4.1). Enable if GITHUB_TOKEN lacks models: read or you want PAT-authenticated access.'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      SECURITY_PAT:
+        required: true
+
+permissions:
+  contents: read
+  models: read   # allows GITHUB_TOKEN to call GitHub Models at no personal quota cost
+
+env:
+  TARGET_REPO: ${{ inputs.target_repo || github.repository }}
+
+jobs:
+  fix-vulnerabilities:
+    runs-on: ubuntu-latest
+    environment: copilot
+    steps:
+      - name: Checkout this repo (for nexus-fix.py)
+        uses: actions/checkout@v4
+
+      - name: Fetch open Dependabot alerts
+        id: fetch_alerts
+        env:
+          GH_TOKEN: ${{ secrets.SECURITY_PAT }}
+        run: |
+          ALERTS=$(gh api \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ env.TARGET_REPO }}/dependabot/alerts?state=open&severity=critical,high&per_page=100") || {
+            echo "::error::Failed to fetch Dependabot alerts. Ensure SECURITY_PAT has repo and security_events access."
+            exit 1
+          }
+
+          echo "$ALERTS" > /tmp/all_alerts.json
+
+          CRITICAL=$(echo "$ALERTS" | jq '[.[] | select(.security_advisory.severity == "critical")] | length')
+          HIGH=$(echo "$ALERTS"     | jq '[.[] | select(.security_advisory.severity == "high")] | length')
+          TOTAL=$(echo "$ALERTS"    | jq 'length')
+
+          echo "total=$TOTAL"       >> "$GITHUB_OUTPUT"
+          echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH"         >> "$GITHUB_OUTPUT"
+          echo "Found $TOTAL alert(s): Critical=$CRITICAL, High=$HIGH"
+
+      - name: Exit if no alerts
+        if: steps.fetch_alerts.outputs.total == '0'
+        run: |
+          echo "No open HIGH/CRITICAL alerts found. Nothing to do."
+          exit 0
+
+      - name: Dry run — print alerts and exit
+        if: inputs.dry_run == true
+        run: |
+          echo "=== DRY RUN ==="
+          echo "Would fix ${{ steps.fetch_alerts.outputs.total }} alert(s) in ${{ env.TARGET_REPO }}"
+          jq -r '.[] | "[\(.security_advisory.severity | ascii_upcase)] \(.dependency.package.name) — \(.security_advisory.cve_id // "N/A") → patch: \(.security_vulnerability.first_patched_version.identifier // "unknown")"' /tmp/all_alerts.json
+          exit 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone target repo
+        run: |
+          BRANCH="security/batch-fix-$(date +%Y-%m-%d)"
+          git clone "https://x-access-token:${{ secrets.SECURITY_PAT }}@github.com/${{ env.TARGET_REPO }}.git" /tmp/target-repo
+          cd /tmp/target-repo
+          git config user.email "nexus-security-bot@github.com"
+          git config user.name "Nexus Security Bot"
+          git checkout -b "$BRANCH"
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Run AI vulnerability fix
+        env:
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SECURITY_PAT: ${{ secrets.SECURITY_PAT }}
+        run: |
+          if [ "${{ inputs.use_security_pat }}" = "true" ]; then
+            PROVIDER="security-pat"
+          else
+            PROVIDER="github-models"
+          fi
+          echo "AI provider: $PROVIDER"
+          python3 .github/scripts/nexus-fix.py \
+            --alerts /tmp/all_alerts.json \
+            --repo-path /tmp/target-repo \
+            --provider "$PROVIDER"
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Validate build
+        id: validate_build
+        working-directory: /tmp/target-repo
+        continue-on-error: true
+        run: |
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew clean build -x test -x checkstyleMain -x checkstyleTest -x pmdMain -x pmdTest
+          else
+            echo "::warning::No gradlew found — skipping build validation"
+          fi
+
+      - name: Run tests
+        id: run_tests
+        working-directory: /tmp/target-repo
+        continue-on-error: true
+        run: |
+          if [ -f "gradlew" ]; then
+            ./gradlew test
+          fi
+
+      - name: Commit and push branch
+        working-directory: /tmp/target-repo
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::warning::No changes detected after AI fix — build file may already be up to date."
+            exit 0
+          fi
+          git commit -m "fix(security): batch fix ${{ steps.fetch_alerts.outputs.total }} HIGH/CRITICAL vulnerabilities"
+          git push "https://x-access-token:${{ secrets.SECURITY_PAT }}@github.com/${{ env.TARGET_REPO }}.git" "$BRANCH"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.SECURITY_PAT }}
+        run: |
+          TOTAL="${{ steps.fetch_alerts.outputs.total }}"
+          CRITICAL="${{ steps.fetch_alerts.outputs.critical }}"
+          HIGH="${{ steps.fetch_alerts.outputs.high }}"
+          BUILD_STATUS="${{ steps.validate_build.outcome }}"
+          TEST_STATUS="${{ steps.run_tests.outcome }}"
+
+          if [ "${{ inputs.use_security_pat }}" = "true" ]; then
+            AI_LABEL="GitHub Models (SECURITY_PAT)"
+          else
+            AI_LABEL="GitHub Models (GITHUB_TOKEN)"
+          fi
+
+          DRAFT_FLAG=""
+          BUILD_NOTE=""
+          if [ "$BUILD_STATUS" != "success" ]; then
+            DRAFT_FLAG="--draft"
+            BUILD_NOTE="> ⚠️ Build validation did not pass — PR opened as draft for manual review."
+          fi
+
+          VULN_TABLE=$(jq -r '.[] | "| \(.security_advisory.cve_id // "N/A") | `\(.dependency.package.name)` | \(.security_advisory.severity | ascii_upcase) | `\(.security_vulnerability.first_patched_version.identifier // "unknown")` |"' /tmp/all_alerts.json)
+
+          gh pr create \
+            --repo "${{ env.TARGET_REPO }}" \
+            --title "fix(security): batch fix ${TOTAL} HIGH/CRITICAL vulnerabilities" \
+            --body "$(printf '%s\n' \
+              "## Security Vulnerability Batch Fix" \
+              "" \
+              "**Alerts fixed:** ${CRITICAL} Critical, ${HIGH} High (${TOTAL} total)" \
+              "**AI model:** ${AI_LABEL}" \
+              "**Branch:** \`${BRANCH}\`" \
+              "" \
+              "${BUILD_NOTE}" \
+              "" \
+              "### Triage applied" \
+              "- Spring Boot minor-version upgrade first — resolves all BOM-managed transitive CVEs in one change" \
+              "- Explicit dependency updates for remaining Bucket B/C alerts" \
+              "" \
+              "### Vulnerabilities addressed" \
+              "| CVE | Package | Severity | Patched Version |" \
+              "|-----|---------|----------|----------------|" \
+              "${VULN_TABLE}" \
+              "" \
+              "### Validation" \
+              "- [$([ "$BUILD_STATUS" = "success" ] && echo "x" || echo " ")] Build compiles successfully" \
+              "- [$([ "$TEST_STATUS"  = "success" ] && echo "x" || echo " ")] All tests pass" \
+              "" \
+              "> Auto-generated by Nexus Security Fix Automation." \
+            )" \
+            --label "security,copilot-security-fix" \
+            $DRAFT_FLAG
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Nexus Security Fix Summary"                                                                                                                                   >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target:** ${{ env.TARGET_REPO }}"                                                                                                                            >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Alerts:** ${{ steps.fetch_alerts.outputs.total }} (Critical: ${{ steps.fetch_alerts.outputs.critical }}, High: ${{ steps.fetch_alerts.outputs.high }})"     >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Build:** ${{ steps.validate_build.outcome }}"                                                                                                                >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tests:** ${{ steps.run_tests.outcome }}"                                                                                                                     >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Dry run:** ${{ inputs.dry_run }}"                                                                                                                            >> "$GITHUB_STEP_SUMMARY"
