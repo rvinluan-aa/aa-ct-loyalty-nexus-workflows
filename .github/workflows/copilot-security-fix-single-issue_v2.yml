@@ -29,7 +29,7 @@ on:
       use_security_pat:
         description: 'Use SECURITY_PAT for AI calls instead of GITHUB_TOKEN. Both use GitHub Models (gpt-4.1).'
         required: false
-        default: true
+        default: false
         type: boolean
     secrets:
       SECURITY_PAT:
@@ -37,6 +37,7 @@ on:
 
 permissions:
   contents: read
+  models: read
 
 env:
   TARGET_REPO: ${{ inputs.target_repo || github.repository }}
